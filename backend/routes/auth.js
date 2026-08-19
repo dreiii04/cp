@@ -11,6 +11,17 @@ const Alumni = require('../models/Users/Alumni');
 const SuperAdmin = require('../models/Users/SuperAdmin');
 const Registrar = require('../models/Registrar');
 const ActivityLog = require('../models/ActivityLog');
+const {
+  ACCESS_TOKEN_TTL_SECONDS,
+  buildRefreshTokenRecord,
+  comparePassword,
+  generateAccessToken,
+  hashRefreshToken,
+  isAccountInactive,
+  isRefreshTokenRecordValid,
+  makeRefreshToken,
+  userDisplayName,
+} = require('../utils/authSession');
 
 // In-memory OTP store: { email: { otp, expiresAt, modelName } }
 const otpStore = {};
@@ -24,13 +35,79 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Helper to generate JWT
-const generateToken = (user) => {
-  return jwt.sign(
-    { id: user._id, email: user.email, role: user.role, name: user.name || `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'User' },
-    process.env.JWT_SECRET || 'supersecretverifitor123',
-    { expiresIn: '1d' }
+const userModels = [
+  { modelName: 'Student', model: Student },
+  { modelName: 'Alumni', model: Alumni },
+  { modelName: 'SuperAdmin', model: SuperAdmin },
+  { modelName: 'Registrar', model: Registrar },
+];
+
+const findUserByEmail = async (email) => {
+  for (const entry of userModels) {
+    const user = await entry.model.findOne({ email });
+    if (user) return { ...entry, user };
+  }
+  return null;
+};
+
+const issueSession = async (user, modelName) => {
+  const refreshToken = makeRefreshToken();
+  const refreshRecord = buildRefreshTokenRecord(refreshToken, user);
+  const result = await user.constructor.updateOne(
+    { _id: user._id },
+    {
+      $push: {
+        refreshTokens: {
+          $each: [refreshRecord],
+          $slice: -5,
+        },
+      },
+    },
   );
+
+  if (result.matchedCount !== 1) {
+    throw new Error('Unable to persist refresh session');
+  }
+
+  const accessToken = generateAccessToken(user, modelName);
+  return {
+    // Keep `token` for the existing web client while exposing the names used
+    // by the Flutter client.
+    token: accessToken,
+    accessToken,
+    refreshToken,
+    expiresInSeconds: ACCESS_TOKEN_TTL_SECONDS,
+  };
+};
+
+const removeRefreshToken = async (user, tokenHash) => user.constructor.updateOne(
+  { _id: user._id, 'refreshTokens.tokenHash': tokenHash },
+  { $pull: { refreshTokens: { tokenHash } } },
+);
+
+const logSuccessfulLogin = async (user) => {
+  try {
+    await ActivityLog.create({
+      userEmail: user.email,
+      userName: userDisplayName(user),
+      action: 'Login',
+      type: '------',
+      status: 'Successful',
+      details: `${user.role} logged into the system`,
+    });
+  } catch (error) {
+    console.error('Unable to write login activity:', error.message);
+  }
+};
+
+const clearLoginLockout = async (clientIp) => {
+  if (!clientIp) return;
+  try {
+    const LoginLockout = require('../models/LoginLockout');
+    await LoginLockout.deleteOne({ ip: clientIp });
+  } catch (error) {
+    console.error('Unable to clear login lockout:', error.message);
+  }
 };
 
 // @route   POST /api/auth/register
@@ -69,7 +146,7 @@ router.post('/register', registerLimiter, registerValidation, validate, async (r
       phoneNumber: phoneNumber || ''
     });
 
-    const token = generateToken(user);
+    const token = generateAccessToken(user, isAlumni ? 'Alumni' : 'Student');
 
     res.status(201).json({
       success: true,
@@ -98,69 +175,39 @@ router.post('/register', registerLimiter, registerValidation, validate, async (r
 router.post('/login', loginProgressiveLimiter, loginValidation, validate, async (req, res) => {
   try {
     const { email, password } = req.body;
+    const result = await findUserByEmail(email);
 
-    let user = null;
-    let modelName = '';
-
-    // 1. Check Student
-    user = await Student.findOne({ email });
-    if (user) modelName = 'Student';
-
-    // 1.5 Check Alumni
-    if (!user) {
-      user = await Alumni.findOne({ email });
-      if (user) modelName = 'Alumni';
-    }
-
-    // 2. Check SuperAdmin
-    if (!user) {
-      user = await SuperAdmin.findOne({ email });
-      if (user) modelName = 'SuperAdmin';
-    }
-
-    // 3. Check Registrar
-    if (!user) {
-      user = await Registrar.findOne({ email });
-      if (user) modelName = 'Registrar';
-    }
-
-    if (!user) {
+    if (!result) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
+    const { user, modelName } = result;
 
-    // Check account status
-    if (user.status && ['inactive', 'stopped'].includes(user.status.toLowerCase())) {
-      return res.status(403).json({ success: false, message: 'Account is currently inactive. Please contact an administrator.' });
-    }
-
-    // Check password
-    const isMatch = await user.comparePassword(password);
+    // Student and alumni records created by the mobile API use
+    // `passwordHash`; records created by the web API use `password`.
+    const isMatch = await comparePassword(user, password);
     if (!isMatch) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    const token = generateToken(user);
-
-    // Log activity
-    await ActivityLog.create({
-      userEmail: user.email,
-      userName: user.name || `${user.firstName || ''} ${user.lastName || ''}`.trim() || 'User',
-      action: 'Login',
-      type: '------',
-      status: 'Successful',
-      details: `${user.role} logged into the system`
-    });
-
-    // Clear the progressive rate limiter on success
-    const LoginLockout = require('../models/LoginLockout');
-    if (req.clientIp) {
-      await LoginLockout.deleteOne({ ip: req.clientIp });
+    // Check the status only after validating the password so callers cannot
+    // use the response to discover inactive accounts.
+    if (isAccountInactive(user)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Account is currently inactive. Please contact an administrator.',
+      });
     }
+
+    const session = await issueSession(user, modelName);
+
+    // Audit and lockout cleanup must not turn a valid login into a 500.
+    await logSuccessfulLogin(user);
+    await clearLoginLockout(req.clientIp);
 
     res.json({
       success: true,
       message: 'Logged in successfully',
-      token,
+      ...session,
       user: {
         id: user._id,
         email: user.email,
@@ -178,6 +225,92 @@ router.post('/login', loginProgressiveLimiter, loginValidation, validate, async 
     console.error('Login error:', error.message);
     console.error('Login error stack:', error.stack);
     res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+router.post('/refresh', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const refreshToken = String(req.body?.refreshToken || '').trim();
+
+    if (!email || !/^[a-f0-9]{96}$/.test(refreshToken)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid email or refresh token.',
+      });
+    }
+
+    const result = await findUserByEmail(email);
+    if (!result) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid refresh session.',
+      });
+    }
+    const { user, modelName } = result;
+
+    if (isAccountInactive(user)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Account is currently inactive. Please contact an administrator.',
+      });
+    }
+
+    const tokenHash = hashRefreshToken(refreshToken);
+    const record = Array.isArray(user.refreshTokens)
+      ? user.refreshTokens.find((item) => item.tokenHash === tokenHash)
+      : null;
+
+    if (!isRefreshTokenRecordValid(record, user)) {
+      await removeRefreshToken(user, tokenHash);
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid refresh session.',
+      });
+    }
+
+    // Consume before issuing the replacement so concurrent replays fail.
+    const consumed = await removeRefreshToken(user, tokenHash);
+    if (consumed.modifiedCount !== 1) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid refresh session.',
+      });
+    }
+
+    const session = await issueSession(user, modelName);
+    return res.json({
+      success: true,
+      message: 'Session refreshed.',
+      ...session,
+    });
+  } catch (error) {
+    console.error('Refresh error:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+router.post('/logout', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const refreshToken = String(req.body?.refreshToken || '').trim();
+
+    if (!email || !/^[a-f0-9]{96}$/.test(refreshToken)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid email or refresh token.',
+      });
+    }
+
+    const result = await findUserByEmail(email);
+    if (result) {
+      await removeRefreshToken(result.user, hashRefreshToken(refreshToken));
+    }
+
+    return res.json({ success: true, message: 'Logged out.' });
+  } catch (error) {
+    console.error('Logout error:', error.message);
+    return res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 

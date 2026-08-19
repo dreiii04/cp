@@ -1,4 +1,31 @@
 const jwt = require('jsonwebtoken');
+const Student = require('../models/Users/Student');
+const Alumni = require('../models/Users/Alumni');
+const Registrar = require('../models/Registrar');
+const SuperAdmin = require('../models/Users/SuperAdmin');
+const { getJwtSecret, isAccountInactive } = require('../utils/authSession');
+
+const modelByName = {
+  Student,
+  Alumni,
+  Registrar,
+  SuperAdmin,
+};
+
+const findTokenUser = async (decoded) => {
+  const preferredModel = modelByName[decoded.modelName];
+  if (preferredModel) {
+    const user = await preferredModel.findById(decoded.id);
+    if (user) return user;
+  }
+
+  for (const model of [Student, Alumni, Registrar, SuperAdmin]) {
+    if (model === preferredModel) continue;
+    const user = await model.findById(decoded.id);
+    if (user) return user;
+  }
+  return null;
+};
 
 const protect = async (req, res, next) => {
   let token;
@@ -13,34 +40,35 @@ const protect = async (req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, getJwtSecret());
+    if (decoded.tokenType && decoded.tokenType !== 'access') {
+      return res.status(401).json({
+        success: false,
+        message: 'Not authorized, token failed',
+      });
+    }
     console.log('Token decoded:', decoded);
 
-    // Dynamic database name resolution fallback to prevent cached "User" names
-    if (!decoded.name || decoded.name === 'User') {
-      try {
-        const Student = require('../models/Users/Student');
-        const Alumni = require('../models/Users/Alumni');
-        const Registrar = require('../models/Registrar');
-        const SuperAdmin = require('../models/Users/SuperAdmin');
+    // Re-check the database on every protected request. Deactivating an
+    // account therefore invalidates its existing access token immediately.
+    const dbUser = await findTokenUser(decoded);
+    if (!dbUser) {
+      return res.status(401).json({
+        success: false,
+        message: 'Not authorized, user not found',
+      });
+    }
+    if (isAccountInactive(dbUser)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Account is currently inactive. Please contact an administrator.',
+      });
+    }
 
-        let dbUser = await Student.findById(decoded.id);
-        if (dbUser) {
-          decoded.name = `${dbUser.firstName || ''} ${dbUser.lastName || ''}`.trim();
-        } else {
-          dbUser = await Alumni.findById(decoded.id);
-          if (dbUser) {
-            decoded.name = `${dbUser.firstName || ''} ${dbUser.lastName || ''}`.trim();
-          } else {
-            dbUser = await Registrar.findById(decoded.id) || await SuperAdmin.findById(decoded.id);
-            if (dbUser) {
-              decoded.name = dbUser.name;
-            }
-          }
-        }
-      } catch (dbErr) {
-        console.error('Failed to resolve dynamic name in auth middleware:', dbErr);
-      }
+    // Dynamic database name resolution prevents stale "User" labels.
+    if (!decoded.name || decoded.name === 'User') {
+      decoded.name = dbUser.name
+        || `${dbUser.firstName || ''} ${dbUser.lastName || ''}`.trim();
     }
 
     if (!decoded.name) {
